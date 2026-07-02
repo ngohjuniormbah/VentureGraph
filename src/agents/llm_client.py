@@ -19,19 +19,25 @@ to that older snapshot, since 3.5 Sonnet has since been superseded. The
 model id is centralized here and overridable via the `VENTUREGRAPH_MODEL`
 environment variable (or a direct function argument) if you need to pin a
 specific snapshot for reproducibility.
+
+This module also exposes async constructors (`get_async_instructor_client`,
+`get_async_anthropic_client`), used by the Venture Catalyst
+(`src.agents.venture_catalyst`), which needs to run several independent LLM
+calls concurrently (ideation, competitor research, and TAM calculation for
+three ideas at once) rather than one at a time.
 """
 
 import os
 
 import instructor
-from anthropic import Anthropic
+from anthropic import Anthropic, AsyncAnthropic
 
 DEFAULT_MODEL = os.environ.get("VENTUREGRAPH_MODEL", "claude-sonnet-5")
 
 
 def get_instructor_client() -> instructor.Instructor:
     """
-    Build an Instructor-wrapped Anthropic client for structured LLM calls.
+    Build a synchronous Instructor-wrapped Anthropic client.
 
     Data flow:
         Reads the Anthropic API key from the `ANTHROPIC_API_KEY`
@@ -50,3 +56,39 @@ def get_instructor_client() -> instructor.Instructor:
         anthropic.AnthropicError: If `ANTHROPIC_API_KEY` is not set.
     """
     return instructor.from_anthropic(Anthropic())
+
+
+def get_async_instructor_client() -> instructor.Instructor:
+    """
+    Build an async Instructor-wrapped Anthropic client.
+
+    Data flow:
+        Same as `get_instructor_client`, but wraps `anthropic.AsyncAnthropic`
+        instead, so `await client.messages.create(response_model=...)` can
+        be run concurrently (via `asyncio.gather`) with other LLM calls -
+        used throughout `src.agents.venture_catalyst` so ideation,
+        competitor research, and TAM calculation for multiple startup ideas
+        can happen in parallel instead of one full round trip at a time.
+
+    Returns:
+        An async `instructor.Instructor` client.
+    """
+    return instructor.from_anthropic(AsyncAnthropic())
+
+
+def get_async_anthropic_client() -> AsyncAnthropic:
+    """
+    Build a plain (non-Instructor) async Anthropic client.
+
+    Data flow:
+        Used by `src.agents.tool_loop.run_agentic_tool_loop`, which needs
+        raw access to the `tools`/`tool_use` message format that
+        Instructor's `response_model` abstraction doesn't expose - the
+        tool loop is a different pattern (multi-turn, model-decides-when-
+        to-call-a-tool) from Instructor's single-shot structured
+        extraction.
+
+    Returns:
+        A plain `anthropic.AsyncAnthropic` client.
+    """
+    return AsyncAnthropic()

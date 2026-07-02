@@ -6,6 +6,7 @@ Usage:
     python main.py parse path/to/paper.pdf [--output-dir output]
     python main.py orkg path/to/paper.pdf [--output-dir output]
     python main.py compare path/to/paper_a.pdf path/to/paper_b.pdf [...] [--output-dir output]
+    python main.py thesis path/to/paper.pdf [--output-dir output]
 
 Subcommands:
     parse    - PDF -> Markdown + ScientificEssence JSON (Docling only, no LLM).
@@ -17,20 +18,30 @@ Subcommands:
                the Comparison Engine (requires ANTHROPIC_API_KEY for the
                per-paper extraction step; the comparison itself is a plain
                deterministic function with no LLM call).
+    thesis   - PDF -> Markdown -> ORKG contribution + Venture Catalyst
+               (startup ideas, competitor research, TAM estimates), combined
+               into a final Investment Thesis Markdown report (requires
+               ANTHROPIC_API_KEY, and TAVILY_API_KEY or BRAVE_API_KEY for
+               live market search). Runs the ORKG extraction and the Venture
+               Catalyst concurrently.
 """
 
 import argparse
+import asyncio
 import sys
 from pathlib import Path
 
 from src.agents.benchmark_agent import extract_paper_benchmarks
 from src.agents.orkg_agent import extract_orkg_contribution
+from src.agents.venture_catalyst import run_venture_catalyst
 from src.comparison.comparison_engine import generate_comparison_report
 from src.extractor.essence_extractor import extract_essence_stub
 from src.parser.pdf_parser import convert_pdf_to_markdown
+from src.report.investment_thesis import render_investment_thesis_markdown
 from src.schemas.benchmarks import PaperBenchmarks
 from src.schemas.orkg import ORKGContribution
 from src.schemas.scientific_essence import ScientificEssence
+from src.schemas.venture import InvestmentThesis
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -85,6 +96,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "pdf_paths", type=Path, nargs="+", help="Paths to two or more scientific PDFs to compare."
     )
     compare_p.add_argument(
+        "--output-dir", type=Path, default=Path("output"), help="Output directory (default: ./output)."
+    )
+
+    thesis_p = subparsers.add_parser(
+        "thesis",
+        help="Generate a full Investment Thesis for a PDF (ORKG + Venture Catalyst, uses Claude + web search).",
+    )
+    thesis_p.add_argument("pdf_path", type=Path, help="Path to the input scientific PDF.")
+    thesis_p.add_argument(
         "--output-dir", type=Path, default=Path("output"), help="Output directory (default: ./output)."
     )
 
@@ -201,6 +221,69 @@ def run_compare(pdf_paths: list[Path], output_dir: Path) -> Path:
     return report_path
 
 
+async def run_thesis(pdf_path: Path, output_dir: Path) -> tuple[Path, Path]:
+    """
+    Run the full pipeline: PDF -> Markdown -> ORKG + Venture Catalyst -> Investment Thesis.
+
+    Data flow:
+        1. Converts `pdf_path` to Markdown via Docling, and extracts a
+           `ScientificEssence` from it (`extract_essence_stub` - no LLM,
+           needed up front since the Venture Catalyst's ideation step reads
+           `essence.methodology`).
+        2. Runs two independent, concurrent branches via `asyncio.gather`:
+             - ORKG extraction (`extract_orkg_contribution`) - this is a
+               synchronous, blocking call, so it's run in a worker thread
+               via `asyncio.to_thread` so it doesn't block the event loop
+               the Venture Catalyst's async work is running on.
+             - The full Venture Catalyst pipeline (`run_venture_catalyst`),
+               which itself internally runs six further branches (2 per
+               idea x 3 ideas) concurrently.
+           Neither branch depends on the other's output, so running them
+           concurrently (rather than ORKG-then-catalyst) removes one whole
+           LLM round trip's worth of latency from the critical path.
+        3. Combines everything into an `InvestmentThesis` and renders it
+           with `render_investment_thesis_markdown`.
+        4. Writes the structured thesis to `<output_dir>/<pdf stem>.thesis.json`
+           and the human-readable report to `<output_dir>/<pdf stem>.thesis.md`.
+
+    Args:
+        pdf_path: Path to the input PDF file.
+        output_dir: Directory where outputs will be written.
+
+    Returns:
+        A tuple `(json_path, markdown_report_path)` pointing to the two
+        files that were written.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    markdown = convert_pdf_to_markdown(pdf_path)
+    (output_dir / f"{pdf_path.stem}.md").write_text(markdown, encoding="utf-8")
+
+    essence = extract_essence_stub(markdown, source_file=str(pdf_path))
+
+    orkg_contribution, idea_dossiers = await asyncio.gather(
+        asyncio.to_thread(extract_orkg_contribution, markdown, essence.paper_title, str(pdf_path)),
+        run_venture_catalyst(essence),
+    )
+
+    thesis = InvestmentThesis(
+        paper_title=essence.paper_title,
+        source_file=str(pdf_path),
+        scientific_essence=essence,
+        orkg_contribution=orkg_contribution,
+        idea_dossiers=idea_dossiers,
+    )
+
+    json_path = output_dir / f"{pdf_path.stem}.thesis.json"
+    json_path.write_text(thesis.model_dump_json(indent=2), encoding="utf-8")
+
+    report = render_investment_thesis_markdown(essence, orkg_contribution, idea_dossiers)
+    report_path = output_dir / f"{pdf_path.stem}.thesis.md"
+    report_path.write_text(report, encoding="utf-8")
+
+    return json_path, report_path
+
+
 def main() -> None:
     """
     CLI entry point: parse arguments, dispatch to the right subcommand.
@@ -234,6 +317,10 @@ def main() -> None:
             sys.exit(1)
         report_path = run_compare(args.pdf_paths, args.output_dir)
         print(f"Comparison report written to: {report_path}")
+    elif args.command == "thesis":
+        json_path, report_path = asyncio.run(run_thesis(args.pdf_path, args.output_dir))
+        print(f"Investment Thesis JSON written to: {json_path}")
+        print(f"Investment Thesis report written to: {report_path}")
 
 
 if __name__ == "__main__":

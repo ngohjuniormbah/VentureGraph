@@ -2,3 +2,5 @@ docling>=2.15.0
 pydantic>=2.6.0
 instructor>=1.4.0
 anthropic>=0.39.0
+tavily-python>=0.7.0
+httpx>=0.27.0

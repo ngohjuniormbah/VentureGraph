@@ -10,9 +10,10 @@ tables and suggest startup ideas grounded in the research.
 
 ```
 VentureGraph/
-├── main.py                        # CLI entry point (parse / orkg / compare)
+├── main.py                        # CLI entry point (parse / orkg / compare / thesis)
 ├── requirements.txt
-├── requirements-dev.txt           # + pytest
+├── requirements-dev.txt           # + pytest, pytest-asyncio
+├── pytest.ini
 ├── tests/
 └── src/
     ├── parser/
@@ -20,15 +21,23 @@ VentureGraph/
     ├── schemas/
     │   ├── scientific_essence.py  # Pydantic schema for a paper's essence
     │   ├── orkg.py                # Triple / ORKGContribution schema
-    │   └── benchmarks.py          # MetricType / BenchmarkResult / PaperBenchmarks schema
+    │   ├── benchmarks.py          # MetricType / BenchmarkResult / PaperBenchmarks schema
+    │   └── venture.py             # StartupIdea(s) / CompetitorLandscape / TAMEstimate / InvestmentThesis
     ├── extractor/
     │   └── essence_extractor.py   # Markdown -> ScientificEssence (heuristic stub)
     ├── agents/
-    │   ├── llm_client.py          # shared Instructor + Anthropic client
+    │   ├── llm_client.py          # shared sync/async Instructor + Anthropic clients
     │   ├── orkg_agent.py          # Markdown -> ORKG contribution triples
-    │   └── benchmark_agent.py     # Markdown -> structured benchmark results
-    └── comparison/
-        └── comparison_engine.py   # deterministic cross-paper comparison table
+    │   ├── benchmark_agent.py     # Markdown -> structured benchmark results
+    │   ├── tool_loop.py           # generic async ReAct-style tool-use loop
+    │   └── venture_catalyst.py    # Startup Ideator + Market Intelligence + TAM Calculator
+    ├── tools/
+    │   ├── web_search.py          # Tavily / Brave search providers (the `web_search` tool)
+    │   └── code_executor.py       # sandboxed subprocess Python execution (the `execute_python` tool)
+    ├── comparison/
+    │   └── comparison_engine.py   # deterministic cross-paper comparison table
+    └── report/
+        └── investment_thesis.py   # deterministic final Investment Thesis Markdown renderer
 ```
 
 ## Why Docling for PDF parsing?
@@ -66,10 +75,16 @@ python main.py orkg path/to/paper.pdf --output-dir output
 
 # Two or more PDFs -> a Markdown benchmark comparison table (needs ANTHROPIC_API_KEY)
 python main.py compare path/to/paper_a.pdf path/to/paper_b.pdf --output-dir output
+
+# PDF -> full Investment Thesis: ORKG + 3 startup ideas + competitors + TAM
+# (needs ANTHROPIC_API_KEY, and TAVILY_API_KEY or BRAVE_API_KEY for live search)
+python main.py thesis path/to/paper.pdf --output-dir output
 ```
 
-`orkg` and `compare` call Claude and require `ANTHROPIC_API_KEY` to be set
-in the environment.
+`orkg`, `compare`, and `thesis` call Claude and require `ANTHROPIC_API_KEY`
+to be set in the environment. `thesis` additionally needs a search API key
+(`TAVILY_API_KEY` by default, or `BRAVE_API_KEY` with `SEARCH_PROVIDER=brave`)
+for its market-research and TAM-calculation steps.
 
 `parse` writes two files to `output/`:
 - `<paper>.md` — the cleaned Markdown extracted from the PDF.
@@ -89,6 +104,10 @@ triples, each with a verbatim `evidence_quote`).
 `compare` writes each paper's `<paper>.md` plus a single `comparison.md`
 containing a Markdown table of benchmark results grouped by dataset, with
 one column per paper.
+
+`thesis` writes `<paper>.md`, `<paper>.thesis.json` (the full structured
+`InvestmentThesis`), and `<paper>.thesis.md` (the human-readable report -
+see the Venture Catalyst section below).
 
 ## The Scientific Intelligence layer (ORKG agent + Comparison Engine)
 
@@ -188,6 +207,119 @@ more capable snapshots), overridable via the `VENTUREGRAPH_MODEL`
 environment variable if you need to pin a specific snapshot for
 reproducibility.
 
+## The Venture Catalyst (Startup Ideator + Market Intelligence + TAM Calculator)
+
+`src/agents/venture_catalyst.py` turns a paper's methodology into a full
+Investment Thesis, in three steps:
+
+1. **Startup Ideator** (`generate_startup_ideas`) — a single-shot Instructor
+   call that reads `ScientificEssence.methodology` and returns exactly three
+   `StartupIdea`s, each with a `methodology_basis` quote grounding it in the
+   actual paper text (same reasoning-field-first + verbatim-quote pattern as
+   the ORKG agent, described above).
+2. **Market Intelligence** (`research_competitors`) — for each idea, runs an
+   agentic tool-use loop (`src/agents/tool_loop.py`) that gives Claude a
+   `web_search` tool and lets it decide how many searches to run and with
+   what queries, then structures the findings into a `CompetitorLandscape`.
+3. **TAM Calculator** (`calculate_tam`) — for each idea, runs the same kind
+   of tool loop, but with *two* tools: `web_search` (to find market-size
+   figures/industry reports) and `execute_python` (to compute the TAM from
+   whatever numbers it finds), then structures the result into a
+   `TAMEstimate` that keeps the exact code executed and its output.
+
+### Why the "Search" integration, not just asking Claude
+
+Claude's parametric knowledge has a training cutoff, but competitor
+landscapes and market-size figures are exactly the kind of fact that goes
+stale continuously - a list of competitors from a training-data snapshot
+could be a year (or several product pivots) out of date, and the model has
+no way to know that on its own. Simply asking "who are the competitors" or
+"what's the market size" and trusting the answer would silently launder
+possibly-stale or invented numbers as if they were current.
+
+The fix is **tool use**, not prompting: `src/tools/web_search.py` gives
+Claude an actual `web_search` tool backed by a live search API (Tavily by
+default, since it's built for LLM-agent search and returns clean
+pre-summarized snippets; Brave Search as an alternative via
+`SEARCH_PROVIDER=brave`). Every call the model makes to this tool is a real
+HTTPS request made *at run time* - not anything baked into the model - and
+the actual retrieved titles/URLs/snippets are what get fed back into the
+conversation. Claude's final synthesis is grounded in that fresh text, and
+every `CompetitorLandscape`/`TAMEstimate` keeps the source URLs that were
+actually used (`sources`/`data_sources`), so a human can click through and
+verify the numbers instead of trusting the model's say-so. The provider
+construction is also lazy (see `_web_search_tool_spec` in
+`venture_catalyst.py`) - it only runs, and only requires an API key, the
+moment the model actually decides to search, not just because the tool was
+made available to it.
+
+The agentic loop that makes this possible lives in
+`src/agents/tool_loop.py`: Claude is given the tool definitions and decides
+for itself, turn by turn, whether to call one, read the result, call
+another (e.g. refine a search query), or give a final answer - this is why
+that loop is implemented against the raw `anthropic` tool-use API rather
+than through Instructor (which is built for single-shot structured
+extraction, not multi-turn tool decisions). Once the loop produces a final
+free-text answer, a short *second* Instructor call reformats it into the
+strict `CompetitorLandscape`/`TAMEstimate` schema - explicitly instructed to
+only restructure what's already there, not add anything, so this final
+formatting step can't reintroduce hallucination after the grounded loop.
+
+### The TAM Calculator's code-execution tool
+
+`src/tools/code_executor.py` gives Claude an `execute_python` tool: instead
+of doing TAM arithmetic "in its head" (where unit mistakes are common and
+invisible), it writes a short script and we actually run it, so the
+reported figure is the real, verifiable output of that script rather than
+a number Claude asserts. It runs in a separate OS subprocess
+(`asyncio.create_subprocess_exec`, no shell involved) under `python3 -I`
+with a wall-clock timeout - process-level isolation plus a timeout, not a
+full security sandbox (the subprocess still shares the host's filesystem/
+network access). That's an acceptable trust boundary for a single-user
+local tool computing arithmetic; a shared/multi-tenant deployment should run
+this inside a locked-down container or VM instead. `TAMEstimate` keeps both
+`calculation_code` and `calculation_output`, so the arithmetic behind every
+TAM figure is fully auditable in the final report.
+
+### Why this module is fully asynchronous
+
+A single idea's dossier needs two independent multi-turn agentic
+conversations (competitor research, TAM calculation), and the Ideator
+produces three ideas - so a fully sequential run would be up to six full
+tool-use conversations, each several Claude round trips plus live search/
+code-execution calls, stacked one after another. None of those six
+branches read each other's output, so there's no correctness reason to
+serialize them:
+
+- `build_idea_dossier` runs `research_competitors` and `calculate_tam`
+  concurrently via `asyncio.gather`.
+- `run_venture_catalyst` runs all three ideas' `build_idea_dossier` calls
+  concurrently via `asyncio.gather`.
+- `main.py`'s `thesis` command additionally runs the ORKG extraction
+  (Scientific Intelligence layer) concurrently with the entire Venture
+  Catalyst pipeline, since neither depends on the other's output (the
+  synchronous `extract_orkg_contribution` call is dispatched via
+  `asyncio.to_thread` so it doesn't block the event loop the rest of the
+  pipeline runs on).
+
+The net effect: wall-clock time for the whole `thesis` command is roughly
+the cost of the *slowest single branch*, not the sum of ~7 sequential LLM
+conversations. `tests/test_venture_catalyst_concurrency.py` proves this is
+real concurrency (not just `async def` syntax) by using fake clients with
+artificial delays and asserting the total elapsed time stays close to one
+branch's cost rather than scaling with the number of calls made.
+
+### The final Investment Thesis report
+
+`src/report/investment_thesis.py` deterministically combines everything the
+three VentureGraph layers produced - the paper's `ScientificEssence`, its
+`ORKGContribution` (Subject/Predicate/Object table), and the Venture
+Catalyst's `IdeaDossier`s (idea, competitors table, TAM calculation with
+code and output) - into one Markdown report, written to
+`<paper>.thesis.md` by `main.py`'s `thesis` command (and as structured JSON
+to `<paper>.thesis.json`). See `tests/test_investment_thesis_report.py` for
+example output.
+
 ## Running the tests
 
 ```bash
@@ -195,6 +327,18 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The comparison-engine and ORKG-agent-grounding tests run with no API key
-and no network access (they use hand-built fixtures / a fake LLM client),
-since they test deterministic logic, not live model behavior.
+All tests run with no API key and no network access - they use hand-built
+fixtures and fake LLM/tool clients, since they test deterministic logic and
+control flow (grounding filters, table/report formatting, the tool loop's
+turn-taking, and the Venture Catalyst's concurrency), not live model
+behavior.
+
+## Environment variables
+
+| Variable | Required for | Notes |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | `orkg`, `compare`, `thesis` | Standard Anthropic API key. |
+| `TAVILY_API_KEY` | `thesis` (default search provider) | From https://tavily.com |
+| `BRAVE_API_KEY` | `thesis`, only if `SEARCH_PROVIDER=brave` | From https://brave.com/search/api |
+| `SEARCH_PROVIDER` | optional | `tavily` (default) or `brave`. |
+| `VENTUREGRAPH_MODEL` | optional | Overrides the default Claude model id for all agents. |
