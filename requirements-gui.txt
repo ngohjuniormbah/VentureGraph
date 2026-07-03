@@ -1,0 +1,7 @@
+# The Streamlit frontend (app_gui.py) is a thin HTTP client for the
+# VentureGraph API - it deliberately does NOT depend on requirements.txt
+# (Docling, Instructor, Anthropic, Tavily), since it never runs the pipeline
+# itself and should stay small/fast to build for hosts like Hugging Face
+# Spaces. See deployment_guide.md.
+streamlit>=1.38.0
+requests>=2.32.0

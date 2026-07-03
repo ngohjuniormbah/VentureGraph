@@ -11,7 +11,14 @@ tables and suggest startup ideas grounded in the research.
 ```
 VentureGraph/
 ├── main.py                        # CLI entry point (parse / orkg / compare / thesis)
-├── requirements.txt
+├── app_api.py                     # FastAPI backend (deploy: Railway, via Dockerfile)
+├── app_gui.py                     # Streamlit frontend (deploy: Hugging Face Spaces)
+├── Dockerfile                     # backend image: system libs + requirements-api.txt
+├── deployment_guide.md            # Railway (backend) + Hugging Face Spaces (frontend) setup
+├── .env.example                   # template for local env vars (.env is gitignored)
+├── requirements.txt                # core pipeline deps (Docling, Instructor, Anthropic, Tavily)
+├── requirements-api.txt           # + fastapi, uvicorn, python-multipart
+├── requirements-gui.txt           # streamlit + requests only (no Docling - thin client)
 ├── requirements-dev.txt           # + pytest, pytest-asyncio
 ├── pytest.ini
 ├── tests/
@@ -36,8 +43,11 @@ VentureGraph/
     │   └── code_executor.py       # sandboxed subprocess Python execution (the `execute_python` tool)
     ├── comparison/
     │   └── comparison_engine.py   # deterministic cross-paper comparison table
-    └── report/
-        └── investment_thesis.py   # deterministic final Investment Thesis Markdown renderer
+    ├── report/
+    │   └── investment_thesis.py   # deterministic final Investment Thesis Markdown renderer
+    └── api/
+        ├── routes.py              # FastAPI routes wrapping the pipeline (used by app_api.py)
+        └── schemas.py             # API response models
 ```
 
 ## Why Docling for PDF parsing?
@@ -108,6 +118,34 @@ one column per paper.
 `thesis` writes `<paper>.md`, `<paper>.thesis.json` (the full structured
 `InvestmentThesis`), and `<paper>.thesis.md` (the human-readable report -
 see the Venture Catalyst section below).
+
+## Running the demo (API + dashboard)
+
+Besides the CLI, the same pipeline is exposed as a web demo: a FastAPI
+backend (`app_api.py`) and a Streamlit dashboard (`app_gui.py`) that calls
+it over HTTP. Locally:
+
+```bash
+# Terminal 1: backend
+pip install -r requirements-api.txt
+export ANTHROPIC_API_KEY=...  # + TAVILY_API_KEY, etc. - see .env.example
+uvicorn app_api:app --reload --port 8000
+
+# Terminal 2: frontend
+pip install -r requirements-gui.txt
+streamlit run app_gui.py
+```
+
+The dashboard has one tab per CLI subcommand (Parse, ORKG, Compare,
+Investment Thesis) and never needs an LLM/search API key itself - it only
+needs to know the backend's URL (`VENTUREGRAPH_API_URL`, defaulting to
+`http://localhost:8000`). This split is deliberate: the backend is where
+Docling, the LLM calls, and every API key live; the frontend is a thin
+client, which is what makes it possible to deploy the two on different
+platforms - see **`deployment_guide.md`** for step-by-step instructions on
+deploying the backend to **Railway** (via the included `Dockerfile`) and
+the frontend to **Hugging Face Spaces**, including exactly where each API
+key gets set on each platform.
 
 ## The Scientific Intelligence layer (ORKG agent + Comparison Engine)
 
@@ -342,3 +380,7 @@ behavior.
 | `BRAVE_API_KEY` | `thesis`, only if `SEARCH_PROVIDER=brave` | From https://brave.com/search/api |
 | `SEARCH_PROVIDER` | optional | `tavily` (default) or `brave`. |
 | `VENTUREGRAPH_MODEL` | optional | Overrides the default Claude model id for all agents. |
+| `CORS_ALLOW_ORIGINS` | `app_api.py`, optional | Comma-separated allowed origins for the API's CORS policy; set to your deployed frontend's exact URL in production instead of the `"*"` default. |
+| `VENTUREGRAPH_API_URL` | `app_gui.py` | Base URL of the backend API the Streamlit dashboard calls; defaults to `http://localhost:8000`. |
+
+See `.env.example` for a copyable template of all of the above.
