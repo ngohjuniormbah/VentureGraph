@@ -48,12 +48,23 @@ Open the service, go to the **Variables** tab, and add:
 
 | Variable | Value |
 |---|---|
-| `ANTHROPIC_API_KEY` | Your Anthropic API key (required for `/orkg`, `/compare`, `/thesis`). |
+| `LLM_PROVIDER` | `anthropic` (default, paid) or `gemini` (free tier, good for testing before paying for Claude - see below). |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key (required for `/orkg`, `/compare`, `/thesis` if `LLM_PROVIDER=anthropic`). |
+| `GEMINI_API_KEY` | Your Gemini API key from [aistudio.google.com](https://aistudio.google.com) (required instead of `ANTHROPIC_API_KEY` if `LLM_PROVIDER=gemini`). |
 | `TAVILY_API_KEY` | Your Tavily API key (required for `/thesis`, if using the default search provider). |
 | `BRAVE_API_KEY` | Your Brave Search API key (only if you set `SEARCH_PROVIDER=brave` instead). |
 | `SEARCH_PROVIDER` | `tavily` (default) or `brave`. Omit to use the default. |
 | `CORS_ALLOW_ORIGINS` | Your Hugging Face Space's exact URL (e.g. `https://your-username-venturegraph.hf.space`). **Set this** instead of leaving the app's `"*"` default in production. |
-| `VENTUREGRAPH_MODEL` | Optional: pins a specific Claude model id. Leave unset to use the default. |
+| `VENTUREGRAPH_MODEL` | Optional: pins a specific model id for whichever provider is configured. Leave unset to use the default. |
+
+**Testing without paying for Claude**: set `LLM_PROVIDER=gemini` and
+`GEMINI_API_KEY` instead of `ANTHROPIC_API_KEY` - Google AI Studio has an
+ongoing free tier, unlike Anthropic's API. Once you're satisfied with the
+results and ready to go live for real users, switch `LLM_PROVIDER` back to
+`anthropic` (or just remove the variable, since that's the default) and add
+`ANTHROPIC_API_KEY` - no code or redeploy-process changes needed, only
+these two variables. See the "Switching LLM providers" section of
+`README.md` for how this works under the hood.
 
 Railway encrypts and injects these as environment variables at container
 start - they're never baked into the image or visible in the repo. Do not
@@ -171,7 +182,8 @@ configuration is needed for a fully local run.
 | Symptom | Likely cause / fix |
 |---|---|
 | Docker build fails with `libGL.so.1: cannot open shared object file` | A system library the `Dockerfile` installs is missing on your build platform's base image; confirm you're building from the provided `Dockerfile` unmodified (it installs `libgl1`/`libglib2.0-0` specifically for this). |
-| `/thesis` or `/orkg` returns a 500 with an Anthropic auth error | `ANTHROPIC_API_KEY` isn't set (or is invalid) in the Railway service's Variables tab. |
+| `/thesis` or `/orkg` returns a 500 with an Anthropic auth error | `ANTHROPIC_API_KEY` isn't set (or is invalid), or `LLM_PROVIDER` is set to `anthropic` but you meant to set `gemini`. |
+| `/thesis` or `/orkg` returns a 500 with a Gemini/`API_KEY_INVALID` error | `LLM_PROVIDER=gemini` but `GEMINI_API_KEY` isn't set or is invalid - check it was copied from [aistudio.google.com](https://aistudio.google.com). |
 | `/thesis` returns a 500 mentioning Tavily/Brave | The matching search API key (`TAVILY_API_KEY` or `BRAVE_API_KEY`) isn't set, or `SEARCH_PROVIDER` doesn't match which key you set. |
 | Streamlit shows "Could not reach the VentureGraph API" | `VENTUREGRAPH_API_URL` (Space secret) is wrong, the Railway service isn't running, or `CORS_ALLOW_ORIGINS` on the backend doesn't include the Space's origin. |
 | First Docling call is very slow | Expected on cold start - Docling downloads its layout/table-structure model weights from Hugging Face on first use and caches them; subsequent calls are fast. Make sure the Railway service has outbound internet access and enough disk for the cache. |

@@ -232,18 +232,64 @@ test cases):
 
 ### On Instructor vs. LangChain, and the model version
 
-`src/agents/llm_client.py` uses **Instructor** wrapping the official
-`anthropic` client, rather than LangChain: Instructor's entire job is
-turning a Pydantic model into a validated, retried structured output from a
-single API call, which is exactly what both agents need and nothing more —
+`src/agents/llm_client.py` uses **Instructor** wrapping the native provider
+client, rather than LangChain: Instructor's entire job is turning a
+Pydantic model into a validated, retried structured output from a single
+API call, which is exactly what both agents need and nothing more —
 LangChain would add a much larger dependency and abstraction surface (chains,
 retrievers, memory) for a use case that doesn't need any of that.
 
 The task brief mentions Claude 3.5 Sonnet; `DEFAULT_MODEL` instead defaults
-to the current Sonnet model (3.5 Sonnet has since been superseded by newer,
-more capable snapshots), overridable via the `VENTUREGRAPH_MODEL`
-environment variable if you need to pin a specific snapshot for
-reproducibility.
+to the current Sonnet model for the Anthropic provider (3.5 Sonnet has
+since been superseded by newer, more capable snapshots), overridable via
+the `VENTUREGRAPH_MODEL` environment variable if you need to pin a specific
+snapshot for reproducibility.
+
+## Switching LLM providers (`LLM_PROVIDER=anthropic|gemini`)
+
+Every agent in this codebase calls whatever client `src/agents/llm_client.py`
+hands it - none of them mention "Anthropic" or "Claude" by name in their
+own code. That's deliberate: `LLM_PROVIDER` (default `anthropic`) picks
+between two provider backends behind two seams:
+
+- **Structured single-shot extraction** (the ORKG agent, benchmark agent,
+  and the Ideator/structuring calls in the Venture Catalyst) goes through
+  **Instructor**, which exposes the identical `client.messages.create(...,
+  response_model=SomeModel)` call shape for both `instructor.from_anthropic`
+  and `instructor.from_genai` (Gemini). These call sites never change
+  between providers.
+- **Multi-turn agentic tool use** (Market Intelligence and the TAM
+  Calculator, which need the model to decide when to call `web_search`/
+  `execute_python` across several turns) goes through the `ChatAdapter`
+  protocol (`src/agents/tool_loop.py`), implemented per provider in
+  `src/agents/chat_adapters.py` - `AnthropicChatAdapter` speaks Anthropic's
+  `tool_use`/`tool_result` content-block format, `GeminiChatAdapter` speaks
+  Gemini's `function_call`/`function_response` parts. `run_agentic_tool_loop`
+  only ever calls `adapter.send()` / `adapter.record_tool_results()` - it
+  has no idea which provider it's driving.
+
+**Why this exists**: Anthropic's API is pay-as-you-go with no ongoing free
+tier - there's no way to run this project's `orkg`/`compare`/`thesis`
+features against Claude without adding paid credits. Google AI Studio's
+Gemini API does have a real, ongoing free tier (rate-limited, but no
+payment required), which makes `LLM_PROVIDER=gemini` a genuinely free way
+to test the whole pipeline end-to-end before paying for Claude. Set
+`LLM_PROVIDER=gemini` and `GEMINI_API_KEY` (from
+[aistudio.google.com](https://aistudio.google.com)) to test for free; leave
+`LLM_PROVIDER` unset (or `anthropic`) with `ANTHROPIC_API_KEY` for
+production. Nothing else needs to change - not the CLI, not the API, not
+the Streamlit frontend.
+
+> Caveat: `AnthropicChatAdapter` is exercised by this project's original
+> tests against the real Anthropic response shape. `GeminiChatAdapter` was
+> built directly against the documented `google-genai` SDK schema and
+> verified with a dry-run call that reached Google's real API (failing only
+> on an invalid placeholder key, i.e. the request shape itself was
+> accepted) - see `tests/test_chat_adapters.py` - but has not been
+> exercised against a live multi-turn Gemini tool-use conversation with a
+> real API key, since none was available while building this. If something
+> doesn't match Gemini's actual behavior in practice, `GeminiChatAdapter`
+> in `src/agents/chat_adapters.py` is the one place to look.
 
 ## The Venture Catalyst (Startup Ideator + Market Intelligence + TAM Calculator)
 
@@ -375,11 +421,13 @@ behavior.
 
 | Variable | Required for | Notes |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | `orkg`, `compare`, `thesis` | Standard Anthropic API key. |
+| `LLM_PROVIDER` | optional | `anthropic` (default) or `gemini`. See "Switching LLM providers" above. |
+| `ANTHROPIC_API_KEY` | `orkg`, `compare`, `thesis`, if `LLM_PROVIDER=anthropic` (default) | From https://console.anthropic.com. Paid - no ongoing free tier. |
+| `GEMINI_API_KEY` | `orkg`, `compare`, `thesis`, if `LLM_PROVIDER=gemini` | From https://aistudio.google.com. Has a real free tier. |
 | `TAVILY_API_KEY` | `thesis` (default search provider) | From https://tavily.com |
 | `BRAVE_API_KEY` | `thesis`, only if `SEARCH_PROVIDER=brave` | From https://brave.com/search/api |
 | `SEARCH_PROVIDER` | optional | `tavily` (default) or `brave`. |
-| `VENTUREGRAPH_MODEL` | optional | Overrides the default Claude model id for all agents. |
+| `VENTUREGRAPH_MODEL` | optional | Overrides the default model id for the configured provider. |
 | `CORS_ALLOW_ORIGINS` | `app_api.py`, optional | Comma-separated allowed origins for the API's CORS policy; set to your deployed frontend's exact URL in production instead of the `"*"` default. |
 | `VENTUREGRAPH_API_URL` | `app_gui.py` | Base URL of the backend API the Streamlit dashboard calls; defaults to `http://localhost:8000`. |
 
