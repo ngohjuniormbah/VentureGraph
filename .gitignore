@@ -7,8 +7,20 @@ venv/
 .mypy_cache/
 .ipynb_checkpoints/
 
-# Generated pipeline outputs
-output/*.md
-output/*.essence.json
+# Generated pipeline outputs (Markdown, essence/ORKG/thesis JSON, comparison
+# reports) - everything main.py/app_api.py write here is reproducible from
+# the source PDFs, so none of it belongs in version control.
+output/*
+!output/.gitkeep
 
+# Local data (sample PDFs, scratch downloads, etc.) - never committed, since
+# it's local working state and may contain papers you don't have rights to
+# redistribute.
+/data/
+
+# Secrets: local environment files and Streamlit's local secrets store.
+# .env.example is the template and IS meant to be committed - see below.
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
