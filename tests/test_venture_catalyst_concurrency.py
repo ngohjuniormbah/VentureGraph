@@ -7,36 +7,30 @@ calls. With real `asyncio.gather` concurrency, it should stay close to the
 slowest single branch instead.
 """
 
+import asyncio
 import time
-import types
 
 import pytest
 
 import src.agents.venture_catalyst as venture_catalyst
+from src.agents.tool_loop import ChatTurn
 from src.schemas.venture import CompetitorLandscape, StartupIdea, StartupIdeas, TAMEstimate
 
 DELAY = 0.2
 
 
-class _FakeToolMessages:
-    """Simulates AsyncAnthropic.messages: always gives a final text answer immediately (no tool calls)."""
+class _FakeDelayedAdapter:
+    """Simulates a ChatAdapter that always gives a final text answer immediately (no tool calls)."""
 
     def __init__(self, delay: float):
         self._delay = delay
 
-    async def create(self, **kwargs):
-        import asyncio
-
+    async def send(self) -> ChatTurn:
         await asyncio.sleep(self._delay)
-        return types.SimpleNamespace(
-            stop_reason="end_turn",
-            content=[types.SimpleNamespace(type="text", text="synthesized findings")],
-        )
+        return ChatTurn(text="synthesized findings", tool_calls=[])
 
-
-class _FakeToolClient:
-    def __init__(self, delay: float):
-        self.messages = _FakeToolMessages(delay)
+    def record_tool_results(self, results) -> None:
+        raise AssertionError("not expected to be called - send() never returns tool_calls in this fake")
 
 
 class _FakeStructuringMessages:
@@ -88,7 +82,9 @@ class _FakeStructuringClient:
 @pytest.fixture
 def fake_clients(monkeypatch):
     """Patch the Venture Catalyst's client constructors with delayed fakes."""
-    monkeypatch.setattr(venture_catalyst, "get_async_anthropic_client", lambda: _FakeToolClient(DELAY))
+    monkeypatch.setattr(
+        venture_catalyst, "get_chat_adapter", lambda *args, **kwargs: _FakeDelayedAdapter(DELAY)
+    )
     monkeypatch.setattr(venture_catalyst, "get_async_instructor_client", lambda: _FakeStructuringClient(DELAY))
 
 

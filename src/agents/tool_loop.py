@@ -1,36 +1,44 @@
 """
-Generic asynchronous ReAct-style tool-use loop for Claude.
+Generic asynchronous ReAct-style tool-use loop.
 
 The Venture Catalyst's Market Intelligence and TAM Calculator agents both
-need Claude to autonomously decide *when* to call a tool (web search,
+need the model to autonomously decide *when* to call a tool (web search,
 Python execution), read the result, and decide whether to call another
 tool or give a final answer. That's a multi-turn pattern Instructor's
-single-shot `response_model` extraction isn't built for (it's designed for
-"one call in, one validated object out"). This module implements that
-multi-turn loop directly against the Anthropic tool-use API; Instructor is
-then used *downstream* of this loop's plain-text final answer, to coerce it
-into a strict Pydantic schema (see `src.agents.venture_catalyst`).
+single-shot `response_model` extraction isn't built for.
+
+This module itself has no idea which LLM provider it's talking to - it's
+written entirely against the `ChatAdapter` protocol below. Each provider's
+actual wire format (Anthropic's `tool_use`/`tool_result` content blocks vs.
+Gemini's `function_call`/`function_response` parts) lives in
+`src/agents/chat_adapters.py`, behind that same interface. That split is
+what makes `LLM_PROVIDER=anthropic|gemini` (see `src/agents/llm_client.py`)
+a config change instead of a rewrite: this loop, and the agents that call
+it (`src/agents/venture_catalyst.py`), never change when the provider does.
 """
 
 import dataclasses
-from typing import Any, Awaitable, Callable
-
-from anthropic import AsyncAnthropic
+from typing import Any, Awaitable, Callable, Protocol
 
 
 @dataclasses.dataclass
 class ToolSpec:
     """
-    Definition of one tool Claude may call during an agentic loop.
+    Definition of one tool the model may call during an agentic loop.
 
     Attributes:
-        name: Tool name, as Claude will refer to it.
-        description: What the tool does and when to use it - shown to
-            Claude verbatim, so this is effectively part of the prompt.
-        input_schema: JSON schema describing the tool's arguments.
+        name: Tool name, as the model will refer to it.
+        description: What the tool does and when to use it - shown to the
+            model verbatim, so this is effectively part of the prompt.
+        input_schema: JSON schema describing the tool's arguments. Passed
+            to whichever provider's adapter is in use; both Anthropic's
+            `tools[].input_schema` and Gemini's
+            `FunctionDeclaration.parameters_json_schema` accept this same
+            plain JSON-schema shape, so no per-provider translation is
+            needed here.
         executor: An async function taking the tool call's arguments as
-            keyword arguments and returning a string to send back to
-            Claude as the tool's result.
+            keyword arguments and returning a string to send back to the
+            model as the tool's result.
     """
 
     name: str
@@ -38,91 +46,107 @@ class ToolSpec:
     input_schema: dict[str, Any]
     executor: Callable[..., Awaitable[str]]
 
-    def to_anthropic_tool(self) -> dict[str, Any]:
-        """Render this spec as the tool-definition dict the Anthropic API expects."""
-        return {
-            "name": self.name,
-            "description": self.description,
-            "input_schema": self.input_schema,
-        }
+
+@dataclasses.dataclass
+class ToolCall:
+    """One tool invocation the model requested, normalized across providers."""
+
+    id: str
+    name: str
+    input: dict[str, Any]
 
 
-async def run_agentic_tool_loop(
-    client: AsyncAnthropic,
-    system: str,
-    user_message: str,
-    tools: list[ToolSpec],
-    model: str,
-    max_turns: int = 6,
-    max_tokens: int = 2048,
-) -> str:
+@dataclasses.dataclass
+class ChatTurn:
     """
-    Run a multi-turn tool-use conversation until Claude gives a final answer.
+    One normalized turn from the model.
+
+    Exactly one of `text`/`tool_calls` is meaningful: if `tool_calls` is
+    non-empty, the model wants those tools run before it will continue: if
+    it's empty, `text` is the model's final answer.
+    """
+
+    text: str | None
+    tool_calls: list[ToolCall]
+
+
+class ChatAdapter(Protocol):
+    """
+    Provider-specific conversation driver, used by `run_agentic_tool_loop`.
+
+    An adapter owns the running conversation history in its provider's
+    native format (constructed with the system prompt, user message, and
+    tool definitions up front - see `AnthropicChatAdapter`/
+    `GeminiChatAdapter` in `chat_adapters.py`), and exposes only these two
+    provider-agnostic operations to the loop.
+    """
+
+    async def send(self) -> ChatTurn:
+        """Send the conversation so far and return the model's next turn."""
+        ...
+
+    def record_tool_results(self, results: list[tuple[ToolCall, str]]) -> None:
+        """Append executed tool results to the conversation, in whatever shape this provider expects."""
+        ...
+
+
+async def run_agentic_tool_loop(adapter: ChatAdapter, tools: list[ToolSpec], max_turns: int = 6) -> str:
+    """
+    Run a multi-turn tool-use conversation until the model gives a final answer.
 
     Data flow:
-        1. Sends `user_message` to Claude along with the given `tools`
-           (converted to Anthropic's tool-definition format).
-        2. If Claude's response has `stop_reason == "tool_use"`, executes
-           every requested tool call by looking up its `executor` in
-           `tools` and awaiting it with the model-provided arguments, then
-           appends both Claude's tool-call message and a `tool_result`
-           message (one per call) back onto the conversation.
-        3. Repeats step 1-2 - so a tool's output can itself prompt another
-           tool call (e.g. search, read the results, search again with a
-           refined query) - until Claude responds without requesting a
+        1. Calls `adapter.send()`, which sends the conversation so far
+           (already primed with the system prompt, user message, and tool
+           definitions when the adapter was constructed) and returns a
+           normalized `ChatTurn`.
+        2. If `turn.tool_calls` is empty, `turn.text` is the model's final
+           answer - return it.
+        3. Otherwise, look up each requested tool call's `executor` (by
+           name, in `tools`) and await it with the model-provided
+           arguments; a failing executor produces a `"Tool error: ..."`
+           string instead of raising, so one bad tool call doesn't crash
+           the whole pipeline.
+        4. Calls `adapter.record_tool_results()` with the
+           `(ToolCall, result_text)` pairs, so the adapter can append them
+           to its history in its provider's native format, then repeats
+           from step 1 - so a tool's output can itself prompt another tool
+           call (e.g. search, read the results, search again with a
+           refined query) - until the model responds without requesting a
            tool, or `max_turns` is reached.
-        4. Returns the concatenated text of that final response, which the
-           caller typically passes to a downstream Instructor call to
-           extract structured data from it.
 
     Args:
-        client: An `AsyncAnthropic` client (not Instructor-wrapped - this
-            loop needs raw access to `tools`/`tool_use` semantics).
-        system: System prompt for the conversation.
-        user_message: The initial user turn.
-        tools: The tools Claude is allowed to call this turn.
-        model: Anthropic model id to use.
+        adapter: A `ChatAdapter` already primed with the system prompt,
+            user message, and tool definitions (see
+            `src.agents.llm_client.get_chat_adapter`).
+        tools: The same tools the adapter was constructed with - used here
+            only to look up each tool's `executor` by name.
         max_turns: Maximum number of request/tool-call round trips before
             giving up.
-        max_tokens: Max tokens per Claude response.
 
     Returns:
-        Claude's final free-text answer (the text content of the first
-        response that doesn't request a tool call).
+        The model's final free-text answer.
 
     Raises:
-        RuntimeError: If `max_turns` is exceeded without Claude producing a
-            final (non-tool-use) answer.
+        RuntimeError: If `max_turns` is exceeded without the model
+            producing a final (non-tool-call) answer.
     """
-    tool_defs = [tool.to_anthropic_tool() for tool in tools]
     executors = {tool.name: tool.executor for tool in tools}
-    messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
 
     for _ in range(max_turns):
-        response = await client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=messages,
-            tools=tool_defs,
-        )
+        turn = await adapter.send()
 
-        if response.stop_reason != "tool_use":
-            return "".join(block.text for block in response.content if block.type == "text")
+        if not turn.tool_calls:
+            return turn.text or ""
 
-        messages.append({"role": "assistant", "content": response.content})
+        results: list[tuple[ToolCall, str]] = []
+        for call in turn.tool_calls:
+            executor = executors[call.name]
+            try:
+                result_text = await executor(**call.input)
+            except Exception as exc:  # surfaced to the model as a tool error, not a crash
+                result_text = f"Tool error: {exc}"
+            results.append((call, result_text))
 
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                executor = executors[block.name]
-                try:
-                    result_text = await executor(**block.input)
-                except Exception as exc:  # surfaced to the model as a tool error, not a crash
-                    result_text = f"Tool error: {exc}"
-                tool_results.append(
-                    {"type": "tool_result", "tool_use_id": block.id, "content": result_text}
-                )
-        messages.append({"role": "user", "content": tool_results})
+        adapter.record_tool_results(results)
 
     raise RuntimeError(f"Tool loop exceeded max_turns={max_turns} without a final answer.")

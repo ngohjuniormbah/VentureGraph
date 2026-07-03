@@ -1,46 +1,33 @@
 """
-Tests for the generic agentic tool-use loop, using a fake Anthropic client
-(no real API call, no network) that simulates: tool call -> tool result ->
-final answer.
-"""
+Tests for the generic, provider-agnostic agentic tool-use loop.
 
-import types
+These use a minimal fake `ChatAdapter` (implementing just `send()` /
+`record_tool_results()`) rather than a fake provider client, since
+`run_agentic_tool_loop` itself never touches provider wire formats -
+that's exactly the point of the `ChatAdapter` seam (see
+`src/agents/chat_adapters.py` for the real Anthropic/Gemini
+implementations, and `test_chat_adapters.py` for tests of those).
+"""
 
 import pytest
 
-from src.agents.tool_loop import ToolSpec, run_agentic_tool_loop
+from src.agents.tool_loop import ChatTurn, ToolCall, ToolSpec, run_agentic_tool_loop
 
 
-def _text_block(text: str):
-    return types.SimpleNamespace(type="text", text=text)
+class _FakeAdapter:
+    """Returns a scripted sequence of ChatTurns, one per `send()` call."""
+
+    def __init__(self, turns: list[ChatTurn]):
+        self._turns = list(turns)
+        self.recorded_results: list[list[tuple[ToolCall, str]]] = []
+
+    async def send(self) -> ChatTurn:
+        return self._turns.pop(0)
+
+    def record_tool_results(self, results: list[tuple[ToolCall, str]]) -> None:
+        self.recorded_results.append(results)
 
 
-def _tool_use_block(tool_use_id: str, name: str, tool_input: dict):
-    return types.SimpleNamespace(type="tool_use", id=tool_use_id, name=name, input=tool_input)
-
-
-def _response(stop_reason: str, content: list):
-    return types.SimpleNamespace(stop_reason=stop_reason, content=content)
-
-
-class _FakeMessages:
-    """Returns a scripted sequence of responses, one per call, ignoring kwargs."""
-
-    def __init__(self, responses: list):
-        self._responses = list(responses)
-        self.calls: list[dict] = []
-
-    async def create(self, **kwargs):
-        self.calls.append(kwargs)
-        return self._responses.pop(0)
-
-
-class _FakeClient:
-    def __init__(self, responses: list):
-        self.messages = _FakeMessages(responses)
-
-
-@pytest.mark.asyncio
 async def test_loop_calls_tool_then_returns_final_text():
     calls_made = []
 
@@ -55,24 +42,20 @@ async def test_loop_calls_tool_then_returns_final_text():
         executor=fake_search,
     )
 
-    fake_client = _FakeClient(
-        responses=[
-            _response("tool_use", [_tool_use_block("call_1", "web_search", {"query": "widget competitors"})]),
-            _response("end_turn", [_text_block("Acme Corp is the main competitor.")]),
+    adapter = _FakeAdapter(
+        turns=[
+            ChatTurn(text=None, tool_calls=[ToolCall(id="call_1", name="web_search", input={"query": "widget competitors"})]),
+            ChatTurn(text="Acme Corp is the main competitor.", tool_calls=[]),
         ]
     )
 
-    result = await run_agentic_tool_loop(
-        fake_client, system="you are helpful", user_message="find competitors", tools=[tool], model="fake-model"
-    )
+    result = await run_agentic_tool_loop(adapter, tools=[tool])
 
     assert result == "Acme Corp is the main competitor."
     assert calls_made == ["widget competitors"]
-    # Two round trips: the tool-use turn, then the final-answer turn.
-    assert len(fake_client.messages.calls) == 2
+    assert len(adapter.recorded_results) == 1
 
 
-@pytest.mark.asyncio
 async def test_loop_raises_after_max_turns_without_final_answer():
     async def fake_search(query: str) -> str:
         return "still searching"
@@ -84,17 +67,14 @@ async def test_loop_raises_after_max_turns_without_final_answer():
         executor=fake_search,
     )
 
-    # Every response requests another tool call - never a final answer.
-    endless_tool_use = _response("tool_use", [_tool_use_block("call_n", "web_search", {"query": "q"})])
-    fake_client = _FakeClient(responses=[endless_tool_use] * 3)
+    # Every turn requests another tool call - never a final answer.
+    endless_tool_use = ChatTurn(text=None, tool_calls=[ToolCall(id="call_n", name="web_search", input={"query": "q"})])
+    adapter = _FakeAdapter(turns=[endless_tool_use] * 3)
 
     with pytest.raises(RuntimeError):
-        await run_agentic_tool_loop(
-            fake_client, system="s", user_message="u", tools=[tool], model="fake-model", max_turns=3
-        )
+        await run_agentic_tool_loop(adapter, tools=[tool], max_turns=3)
 
 
-@pytest.mark.asyncio
 async def test_tool_executor_exception_is_surfaced_as_tool_error_not_a_crash():
     async def failing_tool(query: str) -> str:
         raise ValueError("boom")
@@ -106,19 +86,15 @@ async def test_tool_executor_exception_is_surfaced_as_tool_error_not_a_crash():
         executor=failing_tool,
     )
 
-    fake_client = _FakeClient(
-        responses=[
-            _response("tool_use", [_tool_use_block("call_1", "web_search", {"query": "q"})]),
-            _response("end_turn", [_text_block("recovered")]),
+    adapter = _FakeAdapter(
+        turns=[
+            ChatTurn(text=None, tool_calls=[ToolCall(id="call_1", name="web_search", input={"query": "q"})]),
+            ChatTurn(text="recovered", tool_calls=[]),
         ]
     )
 
-    result = await run_agentic_tool_loop(
-        fake_client, system="s", user_message="u", tools=[tool], model="fake-model"
-    )
+    result = await run_agentic_tool_loop(adapter, tools=[tool])
 
     assert result == "recovered"
-    # The second call's messages should contain the tool error, not raise.
-    second_call_messages = fake_client.messages.calls[1]["messages"]
-    tool_result_content = second_call_messages[-1]["content"][0]["content"]
-    assert "Tool error: boom" in tool_result_content
+    ((call, result_text),) = adapter.recorded_results[0]
+    assert "Tool error: boom" in result_text

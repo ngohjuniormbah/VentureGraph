@@ -38,10 +38,8 @@ them - the difference between, say, 20 seconds and 2 minutes.
 
 import asyncio
 
-from anthropic import AsyncAnthropic
-
-from src.agents.llm_client import DEFAULT_MODEL, get_async_anthropic_client, get_async_instructor_client
-from src.agents.tool_loop import ToolSpec, run_agentic_tool_loop
+from src.agents.llm_client import DEFAULT_MODEL, get_async_instructor_client, get_chat_adapter
+from src.agents.tool_loop import ChatAdapter, ToolSpec, run_agentic_tool_loop
 from src.schemas.scientific_essence import ScientificEssence
 from src.schemas.venture import CompetitorLandscape, IdeaDossier, StartupIdea, StartupIdeas, TAMEstimate
 from src.tools.code_executor import execute_python
@@ -213,19 +211,20 @@ this methodology.
 async def research_competitors(
     idea: StartupIdea,
     model: str = DEFAULT_MODEL,
-    tool_client: AsyncAnthropic | None = None,
+    adapter: ChatAdapter | None = None,
     structuring_client=None,
 ) -> CompetitorLandscape:
     """
     Find current competitors for a startup idea via live web search.
 
     Data flow:
-        1. Builds a `web_search` `ToolSpec` and hands it to
-           `run_agentic_tool_loop` along with a description of `idea`,
-           letting Claude decide how many searches to run and with what
-           queries.
-        2. The loop returns Claude's final free-text synthesis of what it
-           found (grounded in real, live search results - see
+        1. Builds a `web_search` `ToolSpec` and a `ChatAdapter` (via
+           `get_chat_adapter`, provider-selected by `LLM_PROVIDER`) primed
+           with a description of `idea`, and hands both to
+           `run_agentic_tool_loop`, letting the model decide how many
+           searches to run and with what queries.
+        2. The loop returns the model's final free-text synthesis of what
+           it found (grounded in real, live search results - see
            `src.tools.web_search` for why that matters).
         3. A second, short Instructor call reformats that free text into a
            `CompetitorLandscape` - explicitly instructed not to add any
@@ -234,16 +233,16 @@ async def research_competitors(
 
     Args:
         idea: The `StartupIdea` to research competitors for.
-        model: Anthropic model id to use.
-        tool_client: Optional pre-built async Anthropic client (for
-            testing); defaults to `get_async_anthropic_client()`.
+        model: Model id to use.
+        adapter: Optional pre-built `ChatAdapter` (for testing); defaults
+            to one built by `get_chat_adapter()` for the configured
+            provider.
         structuring_client: Optional pre-built async Instructor client (for
             testing); defaults to `get_async_instructor_client()`.
 
     Returns:
         A `CompetitorLandscape` for this idea.
     """
-    tool_client = tool_client or get_async_anthropic_client()
     structuring_client = structuring_client or get_async_instructor_client()
 
     user_message = f"""\
@@ -257,13 +256,9 @@ target customer's industry). Then give your final answer as described in \
 your instructions.
 """
 
-    final_answer = await run_agentic_tool_loop(
-        tool_client,
-        MARKET_INTEL_SYSTEM_PROMPT,
-        user_message,
-        tools=[_web_search_tool_spec()],
-        model=model,
-    )
+    tools = [_web_search_tool_spec()]
+    adapter = adapter or get_chat_adapter(MARKET_INTEL_SYSTEM_PROMPT, user_message, tools, model=model)
+    final_answer = await run_agentic_tool_loop(adapter, tools)
 
     return await structuring_client.messages.create(
         model=model,
@@ -283,18 +278,19 @@ your instructions.
 async def calculate_tam(
     idea: StartupIdea,
     model: str = DEFAULT_MODEL,
-    tool_client: AsyncAnthropic | None = None,
+    adapter: ChatAdapter | None = None,
     structuring_client=None,
 ) -> TAMEstimate:
     """
     Estimate a startup idea's Total Addressable Market via search + code execution.
 
     Data flow:
-        1. Builds `web_search` and `execute_python` `ToolSpec`s and hands
-           both to `run_agentic_tool_loop`, so Claude can search for
-           current market-size figures and then write/run a Python script
-           that computes the TAM from whatever it finds.
-        2. The loop returns Claude's final free-text report (the TAM
+        1. Builds `web_search` and `execute_python` `ToolSpec`s and a
+           `ChatAdapter` (via `get_chat_adapter`) primed with them, then
+           hands both to `run_agentic_tool_loop`, so the model can search
+           for current market-size figures and then write/run a Python
+           script that computes the TAM from whatever it finds.
+        2. The loop returns the model's final free-text report (the TAM
            figure, assumptions, the executed code, its output, and
            sources).
         3. A second, short Instructor call reformats that report into a
@@ -304,16 +300,16 @@ async def calculate_tam(
 
     Args:
         idea: The `StartupIdea` to estimate a TAM for.
-        model: Anthropic model id to use.
-        tool_client: Optional pre-built async Anthropic client (for
-            testing); defaults to `get_async_anthropic_client()`.
+        model: Model id to use.
+        adapter: Optional pre-built `ChatAdapter` (for testing); defaults
+            to one built by `get_chat_adapter()` for the configured
+            provider.
         structuring_client: Optional pre-built async Instructor client (for
             testing); defaults to `get_async_instructor_client()`.
 
     Returns:
         A `TAMEstimate` for this idea.
     """
-    tool_client = tool_client or get_async_anthropic_client()
     structuring_client = structuring_client or get_async_instructor_client()
 
     user_message = f"""\
@@ -327,14 +323,9 @@ that computes the TAM from them, then give your final answer as described \
 in your instructions.
 """
 
-    final_answer = await run_agentic_tool_loop(
-        tool_client,
-        TAM_SYSTEM_PROMPT,
-        user_message,
-        tools=[_web_search_tool_spec(), _execute_python_tool_spec()],
-        model=model,
-        max_turns=8,
-    )
+    tools = [_web_search_tool_spec(), _execute_python_tool_spec()]
+    adapter = adapter or get_chat_adapter(TAM_SYSTEM_PROMPT, user_message, tools, model=model)
+    final_answer = await run_agentic_tool_loop(adapter, tools, max_turns=8)
 
     return await structuring_client.messages.create(
         model=model,
